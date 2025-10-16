@@ -1,0 +1,402 @@
+#include <Wire.h>
+#include <Adafruit_MCP4728.h>
+#include <USB.h>
+#include <USBMIDI.h>
+#include <Preferences.h>
+
+// Hardware setup
+Adafruit_MCP4728 dac;
+USBMIDI MIDI;
+Preferences prefs;
+
+// Pin definitions
+#define GATE1_PIN 2      // Gate output for voice 1
+#define GATE2_PIN 4      // Gate output for voice 2
+#define GATE3_PIN 5      // Gate output for voice 3
+#define GATE4_PIN 6      // Gate output for voice 4
+#define CLOCK_PIN 15     // MIDI clock output
+#define LED_PIN 8        // Activity LED
+#define CAL_BUTTON 0     // Boot button for calibration
+
+// Calibration data
+struct CalData {
+  float offset[4] = {0.0, 0.0, 0.0, 0.0};
+  float scale[4] = {1.0, 1.0, 1.0, 1.0};
+} cal;
+
+// Voice tracking
+struct Voice {
+  int note = -1;
+  bool active = false;
+  unsigned long timestamp = 0;
+  int gatePin = 0;
+};
+
+Voice voices[4];
+
+// Clock handling
+bool clockState = false;
+
+// Calibration mode
+bool calibrationMode = false;
+unsigned long calButtonPress = 0;
+int calTestNote = 60;  // C4 for calibration
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  // Initialize voice gate pins
+  voices[0].gatePin = GATE1_PIN;
+  voices[1].gatePin = GATE2_PIN;
+  voices[2].gatePin = GATE3_PIN;
+  voices[3].gatePin = GATE4_PIN;
+  
+  // Initialize pins
+  pinMode(GATE1_PIN, OUTPUT);
+  pinMode(GATE2_PIN, OUTPUT);
+  pinMode(GATE3_PIN, OUTPUT);
+  pinMode(GATE4_PIN, OUTPUT);
+  pinMode(CLOCK_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(CAL_BUTTON, INPUT_PULLUP);
+  
+  // Initialize I2C
+  Wire.begin();
+  
+  // Load calibration
+  prefs.begin("midicv", false);
+  loadCalibration();
+  
+  // Initialize MCP4728
+  if (!dac.begin()) {
+    Serial.println("ERROR: MCP4728 not found!");
+    Serial.println("Check I2C connections and address");
+    while (1) {
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      delay(200);
+    }
+  }
+  
+  Serial.println("MCP4728 initialized successfully");
+  
+  // Initialize USB MIDI
+  MIDI.begin();
+  USB.begin();
+  
+  Serial.println("=================================");
+  Serial.println("ESP32-S3 Quad MIDI-to-CV");
+  Serial.println("=================================");
+  Serial.println("Hardware: MCP4728 (4-channel DAC)");
+  Serial.println("4x CV Outputs (1V/octave)");
+  Serial.println("4x Gate Outputs");
+  Serial.println("1x MIDI Clock Output");
+  Serial.println();
+  Serial.println("Calibration values:");
+  for (int i = 0; i < 4; i++) {
+    Serial.printf("  CV%d: offset=%.3fV, scale=%.3f\n", 
+                  i+1, cal.offset[i], cal.scale[i]);
+  }
+  Serial.println();
+  Serial.println("Hold BOOT button for 3 seconds");
+  Serial.println("to enter calibration mode");
+  Serial.println("=================================");
+}
+
+void loop() {
+  handleCalibrationButton();
+  
+  if (calibrationMode) {
+    handleCalibration();
+  } else {
+    handleMIDI();
+  }
+  
+  delay(1);
+}
+
+void handleMIDI() {
+  midiEventPacket_t packet;
+  
+  if (MIDI.readPacket(&packet)) {
+    digitalWrite(LED_PIN, HIGH);
+    
+    uint8_t type = packet.byte1 & 0xF0;
+    uint8_t data1 = packet.byte2;
+    uint8_t data2 = packet.byte3;
+    
+    switch (type) {
+      case 0x90:  // Note On
+        if (data2 > 0) {
+          assignNote(data1, data2);
+        } else {
+          releaseNote(data1);
+        }
+        break;
+        
+      case 0x80:  // Note Off
+        releaseNote(data1);
+        break;
+        
+      case 0xF8:  // MIDI Clock
+        handleClock();
+        break;
+    }
+    
+    delay(1);
+    digitalWrite(LED_PIN, LOW);
+  }
+}
+
+void assignNote(int note, int velocity) {
+  unsigned long now = millis();
+  int voiceIndex = -1;
+  
+  // Voice allocation priority:
+  // 1. First inactive voice
+  // 2. Voice already playing same note (retriggering)
+  // 3. Oldest active voice (voice stealing)
+  
+  // Check for inactive voice first
+  for (int i = 0; i < 4; i++) {
+    if (!voices[i].active) {
+      voiceIndex = i;
+      break;
+    }
+  }
+  
+  // If all voices active, check for retriggering same note
+  if (voiceIndex == -1) {
+    for (int i = 0; i < 4; i++) {
+      if (voices[i].note == note) {
+        voiceIndex = i;
+        break;
+      }
+    }
+  }
+  
+  // If still no voice, steal oldest
+  if (voiceIndex == -1) {
+    unsigned long oldest = now;
+    for (int i = 0; i < 4; i++) {
+      if (voices[i].timestamp < oldest) {
+        oldest = voices[i].timestamp;
+        voiceIndex = i;
+      }
+    }
+  }
+  
+  // Assign note to selected voice
+  if (voiceIndex >= 0) {
+    setVoice(voiceIndex, note, velocity, now);
+    Serial.printf("Note ON: %d (vel: %d) -> Voice %d\n", note, velocity, voiceIndex + 1);
+  }
+}
+
+void releaseNote(int note) {
+  for (int i = 0; i < 4; i++) {
+    if (voices[i].active && voices[i].note == note) {
+      voices[i].active = false;
+      digitalWrite(voices[i].gatePin, LOW);
+      Serial.printf("Note OFF: %d (Voice %d)\n", note, i + 1);
+    }
+  }
+}
+
+void setVoice(int voiceNum, int note, int velocity, unsigned long timestamp) {
+  voices[voiceNum].note = note;
+  voices[voiceNum].active = true;
+  voices[voiceNum].timestamp = timestamp;
+  
+  // Calculate voltage
+  float voltage = noteToVoltage(note, voiceNum);
+  
+  // Convert to 12-bit DAC value (0-4095)
+  uint16_t dacValue = constrain((int)(voltage * 4095.0 / 5.0), 0, 4095);
+  
+  // Set appropriate channel on MCP4728
+  MCP4728_channel_t channel;
+  switch (voiceNum) {
+    case 0: channel = MCP4728_CHANNEL_A; break;
+    case 1: channel = MCP4728_CHANNEL_B; break;
+    case 2: channel = MCP4728_CHANNEL_C; break;
+    case 3: channel = MCP4728_CHANNEL_D; break;
+    default: return;
+  }
+  
+  dac.setChannelValue(channel, dacValue);
+  
+  // Set gate high
+  digitalWrite(voices[voiceNum].gatePin, HIGH);
+}
+
+float noteToVoltage(int midiNote, int voiceNum) {
+  // Standard 1V/octave: C4 (MIDI 60) = 1.000V
+  float baseVoltage = ((float)(midiNote - 60) / 12.0) + 1.0;
+  
+  // Apply calibration
+  return (baseVoltage * cal.scale[voiceNum]) + cal.offset[voiceNum];
+}
+
+void handleClock() {
+  // Output clock pulse
+  clockState = !clockState;
+  digitalWrite(CLOCK_PIN, clockState ? HIGH : LOW);
+}
+
+void handleCalibrationButton() {
+  static bool lastState = HIGH;
+  bool currentState = digitalRead(CAL_BUTTON);
+  
+  // Button pressed
+  if (currentState == LOW && lastState == HIGH) {
+    calButtonPress = millis();
+  }
+  
+  // Button held for 3 seconds
+  if (currentState == LOW && (millis() - calButtonPress > 3000) && !calibrationMode) {
+    calibrationMode = true;
+    Serial.println("\n=============================");
+    Serial.println("   CALIBRATION MODE");
+    Serial.println("=============================");
+    Serial.println("All outputs set to C4 (1.000V)");
+    Serial.println("\nCommands:");
+    Serial.println("  1+/1-   = CV1 offset ±1mV");
+    Serial.println("  2+/2-   = CV2 offset ±1mV");
+    Serial.println("  3+/3-   = CV3 offset ±1mV");
+    Serial.println("  4+/4-   = CV4 offset ±1mV");
+    Serial.println("  s1+/s1- = CV1 scale ±0.001");
+    Serial.println("  s2+/s2- = CV2 scale ±0.001");
+    Serial.println("  s3+/s3- = CV3 scale ±0.001");
+    Serial.println("  s4+/s4- = CV4 scale ±0.001");
+    Serial.println("  note X  = Set test note (e.g., 'note 72' for C5)");
+    Serial.println("  show    = Show current values");
+    Serial.println("  save    = Save and exit");
+    Serial.println("  exit    = Exit without saving");
+    Serial.println("=============================\n");
+    
+    // Set all outputs to test note for calibration
+    for (int i = 0; i < 4; i++) {
+      setVoice(i, calTestNote, 100, millis());
+    }
+    
+    showCalibrationValues();
+  }
+  
+  lastState = currentState;
+}
+
+void handleCalibration() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    
+    bool needUpdate = false;
+    
+    // Offset adjustments
+    if (cmd == "1+") { cal.offset[0] += 0.001; needUpdate = true; Serial.printf("CV1 offset: %.4fV\n", cal.offset[0]); }
+    else if (cmd == "1-") { cal.offset[0] -= 0.001; needUpdate = true; Serial.printf("CV1 offset: %.4fV\n", cal.offset[0]); }
+    else if (cmd == "2+") { cal.offset[1] += 0.001; needUpdate = true; Serial.printf("CV2 offset: %.4fV\n", cal.offset[1]); }
+    else if (cmd == "2-") { cal.offset[1] -= 0.001; needUpdate = true; Serial.printf("CV2 offset: %.4fV\n", cal.offset[1]); }
+    else if (cmd == "3+") { cal.offset[2] += 0.001; needUpdate = true; Serial.printf("CV3 offset: %.4fV\n", cal.offset[2]); }
+    else if (cmd == "3-") { cal.offset[2] -= 0.001; needUpdate = true; Serial.printf("CV3 offset: %.4fV\n", cal.offset[2]); }
+    else if (cmd == "4+") { cal.offset[3] += 0.001; needUpdate = true; Serial.printf("CV4 offset: %.4fV\n", cal.offset[3]); }
+    else if (cmd == "4-") { cal.offset[3] -= 0.001; needUpdate = true; Serial.printf("CV4 offset: %.4fV\n", cal.offset[3]); }
+    
+    // Scale adjustments
+    else if (cmd == "s1+") { cal.scale[0] += 0.001; needUpdate = true; Serial.printf("CV1 scale: %.4f\n", cal.scale[0]); }
+    else if (cmd == "s1-") { cal.scale[0] -= 0.001; needUpdate = true; Serial.printf("CV1 scale: %.4f\n", cal.scale[0]); }
+    else if (cmd == "s2+") { cal.scale[1] += 0.001; needUpdate = true; Serial.printf("CV2 scale: %.4f\n", cal.scale[1]); }
+    else if (cmd == "s2-") { cal.scale[1] -= 0.001; needUpdate = true; Serial.printf("CV2 scale: %.4f\n", cal.scale[1]); }
+    else if (cmd == "s3+") { cal.scale[2] += 0.001; needUpdate = true; Serial.printf("CV3 scale: %.4f\n", cal.scale[2]); }
+    else if (cmd == "s3-") { cal.scale[2] -= 0.001; needUpdate = true; Serial.printf("CV3 scale: %.4f\n", cal.scale[2]); }
+    else if (cmd == "s4+") { cal.scale[3] += 0.001; needUpdate = true; Serial.printf("CV4 scale: %.4f\n", cal.scale[3]); }
+    else if (cmd == "s4-") { cal.scale[3] -= 0.001; needUpdate = true; Serial.printf("CV4 scale: %.4f\n", cal.scale[3]); }
+    
+    // Change test note
+    else if (cmd.startsWith("note ")) {
+      int newNote = cmd.substring(5).toInt();
+      if (newNote >= 0 && newNote <= 127) {
+        calTestNote = newNote;
+        needUpdate = true;
+        Serial.printf("Test note changed to: %d\n", calTestNote);
+      }
+    }
+    
+    // Show current values
+    else if (cmd == "show") {
+      showCalibrationValues();
+    }
+    
+    // Save and exit
+    else if (cmd == "save") {
+      saveCalibration();
+      exitCalibration();
+      Serial.println("Calibration SAVED and applied!\n");
+    }
+    
+    // Exit without saving
+    else if (cmd == "exit") {
+      loadCalibration();  // Reload old values
+      exitCalibration();
+      Serial.println("Calibration CANCELLED\n");
+    }
+    
+    else {
+      Serial.println("Unknown command. Type 'show' for current values.");
+    }
+    
+    // Update outputs if values changed
+    if (needUpdate) {
+      for (int i = 0; i < 4; i++) {
+        setVoice(i, calTestNote, 100, millis());
+      }
+    }
+  }
+}
+
+void showCalibrationValues() {
+  Serial.println("\nCurrent Calibration:");
+  Serial.printf("Test note: %d\n", calTestNote);
+  for (int i = 0; i < 4; i++) {
+    float voltage = noteToVoltage(calTestNote, i);
+    Serial.printf("  CV%d: offset=%+.4fV, scale=%.4f -> %.3fV output\n", 
+                  i+1, cal.offset[i], cal.scale[i], voltage);
+  }
+  Serial.println();
+}
+
+void exitCalibration() {
+  calibrationMode = false;
+  
+  // Clear all voices
+  for (int i = 0; i < 4; i++) {
+    voices[i].active = false;
+    digitalWrite(voices[i].gatePin, LOW);
+  }
+  
+  // Reset DAC outputs to 0V
+  dac.setChannelValue(MCP4728_CHANNEL_A, 0);
+  dac.setChannelValue(MCP4728_CHANNEL_B, 0);
+  dac.setChannelValue(MCP4728_CHANNEL_C, 0);
+  dac.setChannelValue(MCP4728_CHANNEL_D, 0);
+}
+
+void loadCalibration() {
+  for (int i = 0; i < 4; i++) {
+    String offKey = "off" + String(i);
+    String sclKey = "scl" + String(i);
+    cal.offset[i] = prefs.getFloat(offKey.c_str(), 0.0);
+    cal.scale[i] = prefs.getFloat(sclKey.c_str(), 1.0);
+  }
+}
+
+void saveCalibration() {
+  for (int i = 0; i < 4; i++) {
+    String offKey = "off" + String(i);
+    String sclKey = "scl" + String(i);
+    prefs.putFloat(offKey.c_str(), cal.offset[i]);
+    prefs.putFloat(sclKey.c_str(), cal.scale[i]);
+  }
+  Serial.println("Calibration saved to flash memory");
+}
